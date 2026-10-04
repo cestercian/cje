@@ -381,8 +381,8 @@ directories.
 | Boundary card | OK / CAUTION / REFUSE-LEVEL | Scalar score-range support only. REFUSE-LEVEL: no absolute level claim from this fit; it does not establish ranking validity. A card with `applies_to_current_estimate: false` describes the map, not the reported (complete-oracle or residual-corrected) level |
 | `reliability_gates[p]["flagged"]` | bool | Surface the point estimate with the limitation; do not substitute another policy silently |
 | `reliability_gates[p]["notes"]` / `["exemption"]` | list / `"residual_corrected"` | A map finding that did not gate the corrected level, or a failed design check. Report it as evidence about the map, not about the corrected estimate |
-| `correction_checks[p]` | `passed`, `failed`, `effective_labelled_prompts`, `design_effective_n`, `balance_t` | Whether the correction's labels can lift map gates. A failure keeps the gates; `labelled_rows_unbalanced` means the labels do not look like the declared design's sample |
-| `level_basis[p]` | oracle / residual_corrected / calibration_map | What the reported level rests on. A corrected-vs-map ranking after a lifted FAIL is not established |
+| `correction_checks[p]` | `passed`, `failed`, `effective_labelled_prompts`, `design_effective_n`, `unlabelled_certain_rows`, `balance_t` | Whether the correction's labels can lift map gates. A failure keeps the gates; `labelled_rows_unbalanced` means the labels do not look like the declared design's sample |
+| `level_basis[p]` | oracle / residual_corrected / calibration_map | What the reported level rests on, by the gates' rule (a correction that fails its design check is calibration_map). A corrected-vs-map ranking after a lifted FAIL is not established |
 | Transport `status` | PASS / FAIL / INCONCLUSIVE / NOT_GRADED / NOT_CHECKED | Equivalence verdict for the declared residual margin; interpret only for the audited population and family. NOT_CHECKED = no probe was supplied for that policy; never treat it as a pass |
 
 ## Troubleshooting

@@ -22,8 +22,11 @@
   `cje.diagnostics.gates`), labelled outcomes that are not all identical, and
   judge-score balance under the declared design. Known-propensity designs are
   included and also need a design effective sample size `N^2 / sum(1/p)` of at
-  least 20, which catches rare high-weight strata. An exempt policy keeps the
-  audit record and card, with `applies_to_current_estimate: false`,
+  least 20, which catches rare high-weight strata, and no unlabelled row
+  declared at propensity 1 (`unlabelled_rows_declared_certain`: propensity 1
+  means "always labelled", not "no reweighting", and with it the correction
+  leaves the level near the map's). An exempt policy keeps the audit record
+  and card, with `applies_to_current_estimate: false`,
   `gate_exemption: "residual_corrected"` and a gate note, and `summary()`
   marks it `[corrected: map gates not applied]`. Plug-in routes (`plug_in`,
   `plug_in_targeted_unknown`), `no_data`, unknown routes, and augmented
@@ -32,49 +35,58 @@
 - **Correction design check.** The balance part tests whether the
   Horvitz-Thompson weighted labelled rows reproduce the policy's judge-score
   mean and spread (and, under known propensities, its row count) within 3
-  design standard errors (`CORRECTION_DESIGN_BALANCE_T`). It catches labels
-  selected by judge score (the top, bottom, a band or the tails were caught
-  in every simulated run at 20 or more labels) and propensities declared
-  constant when selection depended on the score. It is a falsification check:
-  it cannot see selection unrelated to the score, misses mild score tilts, and
-  does not balance calibrator covariates. Under random representative labels
-  it fails about 0.5% of the time per policy, which only restores 0.9.0
-  gating for that policy. A failure on balance or design size logs a WARNING
-  and adds a gate note even when no map finding exists, and the CLI and
-  `summary()` show it as a limitation of the winner; it never demotes.
-  `calibrated_mean_ci` runs the same check (`diagnostics["correction_check"]`)
-  and scopes its badge warning the same way; its estimate and interval are
-  unchanged.
+  design standard errors (`CORRECTION_DESIGN_BALANCE_T`). The standard errors
+  are over prompt clusters (under known propensities, at least the declared
+  row-level Poisson one), so designs that label every draw of a sampled prompt
+  are graded correctly. It catches labels selected by judge score (the top,
+  bottom, a band or the tails were caught in every simulated run at 20 or more
+  labels) and propensities declared constant when selection depended on the
+  score. It is a falsification check: it cannot see selection unrelated to the
+  score, misses mild score tilts, and does not balance calibrator covariates.
+  Under random representative labels it fails about 0.5% of the time per
+  policy, and under correctly declared known propensities 0.1-2% (median
+  0.55%, highest at 20 labelled prompts with 4 draws each), which only
+  restores 0.9.0 gating for that policy. A failure on balance, design size or
+  a propensity-1 declaration logs a WARNING and adds a gate note even when no
+  map finding exists, and the CLI and `summary()` show it as a limitation of
+  the winner; it never demotes. `calibrated_mean_ci` runs the same check
+  (`diagnostics["correction_check"]`) and scopes its badge warning the same
+  way; its estimate and interval are unchanged.
 - **Other behaviour changes.** For an exempt policy the whole boundary card is
   out of scope, so `CAUTION` and `INCONCLUSIVE` cards no longer set WARNING
   for it, and a `REFUSE-LEVEL` card logs at INFO.
   `DirectDiagnostics.refuse_level_policies` and `validate()` now honour
   `applies_to_current_estimate`, so they also stop listing `direct_oracle`
   cards. `metadata["transport_status"]` remains the worst map state (it still
-  reads `FAIL` when the only `FAIL` was lifted). New metadata:
-  `level_basis` (`oracle` / `residual_corrected` / `calibration_map` per
-  policy), `correction_checks`, and audit keys `route`, `gate_exemption`,
-  `probe_overlap` and `probes_independent`; `GateResult` gains `notes` and
-  `exemption`.
+  reads `FAIL` when the only `FAIL` was lifted). New metadata: `level_basis`
+  (`oracle` / `residual_corrected` / `calibration_map` per policy, by the
+  gates' rule: an augmented policy whose design check fails is
+  `calibration_map`), `correction_checks`, and audit keys `route`,
+  `gate_exemption`, `probe_overlap` and `probes_independent`; `GateResult`
+  gains `notes` and `exemption`.
 - **Map-offset caution for mixed rankings.** After a lifted `FAIL`, a
   comparison of the corrected policy with a policy whose level still rests on
-  the map (plug-in, not flagged, no `PASS` audit) does not cancel the map
-  offset the audit found. `compare_policies` adds `map_offset_uncancelled` and
-  logs a warning, and the winner's limitations say the ranking is not
-  established. Nothing is demoted, and runs where no `FAIL` was lifted are
-  unchanged.
+  the map (plug-in, or augmented with a failed design check; not flagged, no
+  `PASS` audit) does not cancel the map offset the audit found.
+  `compare_policies` adds `map_offset_uncancelled` and logs a warning, and the
+  winner's limitations say the ranking is not established. Nothing is demoted,
+  and runs where no `FAIL` was lifted are unchanged.
 - **Transport probes that reuse labelled evaluation rows.** Probes that are a
   policy's own labelled evaluation rows (matched by `observation_id`, explicit
-  `(source_id, row_id)`, or the same prompt plus `response_id`, response text
-  or `draw_idx`; index-fallback prompt ids are never matched) are kept, logged
-  with one warning per policy, and recorded as `probes_independent: false`
-  with counts in `probe_overlap`. **A probe that exactly matches a row that
-  also fitted the calibrator now raises** `ValueError`; 0.9.0 silently ran an
-  in-sample audit, which a map-dependent policy could pass. Keep the fit
-  external with `combine_oracle_sources=False`, as the guide does. Ambiguous
-  matches (several draws per prompt, no `draw_idx`) only warn. Saved results
-  replay the gates they were saved with: corrected policies saved by 0.9.0
-  stay flagged until re-run.
+  `(source_id, row_id)`, or the same prompt plus `response_id` or response
+  text; without those, the same prompt plus an equal judge score and oracle
+  label, so a new response on a labelled prompt is not a reused row;
+  index-fallback prompt ids are never matched) are kept, logged with one
+  warning per policy, and recorded as `probes_independent: false` with counts
+  in `probe_overlap` (`n_reused` probes, `n_reused_rows` distinct rows). **A
+  probe that exactly matches a row that also fitted the calibrator now
+  raises** `ValueError`; 0.9.0 silently ran an in-sample audit, which a
+  map-dependent policy could pass. Keep the fit external with
+  `combine_oracle_sources=False`, as the guide does. Ambiguous matches
+  (several draws per prompt and no `draw_idx`, or a `draw_idx` that differs
+  from the equal-valued row's) only warn. Saved results replay the gates they
+  were saved with: corrected policies saved by 0.9.0 stay flagged until
+  re-run.
 
 ## [0.9.0] - 2026-10-04
 

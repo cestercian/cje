@@ -107,12 +107,17 @@ def worst_status(*statuses: Optional[Status]) -> Status:
 #   the design effective n was 12.8 and the interval covered 0.167 of the time.
 # * Balance threshold (design-check simulations): under random representative
 #   labels (discrete and continuous judges, 1-2 draws per prompt, 20/30/60
-#   labelled prompts) P(max |t| >= 3) was 0.1-0.65%, and 0.8-1.3% under
-#   correct known propensities; labels on the top, bottom, middle band or
-#   tails by score were caught in every run at 20+ labelled prompts. The check
-#   is a falsification test only: it cannot see selection unrelated to the
-#   judge score, and a mild exp(0.5 z) score tilt is caught only 11/28/76% of
-#   the time at 20/30/60 labels.
+#   labelled prompts) P(max |t| >= 3) was 0.1-0.65%. Under correctly declared
+#   known propensities (constant or score-dependent; each row or each whole
+#   prompt sampled; 1/2/4 draws per prompt; 20/30/60 expected labelled
+#   prompts; 2,000 seeds per cell) it was 0.1-2.0%, median 0.55%, highest at
+#   20 labelled prompts with 4 draws each; a row-level Poisson variance alone
+#   gave 7% at 2 and 27% at 4 draws when whole prompts were sampled (p=0.25,
+#   150 prompts, 400 seeds). Labels on the top, bottom, middle band or tails
+#   by score were caught in every run at 20+ labelled prompts under both
+#   designs. The check is a falsification test only: it cannot see selection
+#   unrelated to the judge score, and a mild exp(0.5 z) score tilt is caught
+#   only 11-14/28-34/74-77% of the time at 20/30/60 labels.
 CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS = 20
 CORRECTION_DESIGN_BALANCE_T = 3.0
 
@@ -120,7 +125,11 @@ CORRECTION_DESIGN_BALANCE_T = 3.0
 # other codes (too few labels, constant labelled outcomes) only withhold the
 # exemption: 0.9.0 already warns about constant labelled outcomes, and a small
 # label count is visible in the interval.
-_CORRECTION_WARNED_FAILURES = ("labelled_rows_unbalanced", "low_design_effective_n")
+_CORRECTION_WARNED_FAILURES = (
+    "labelled_rows_unbalanced",
+    "low_design_effective_n",
+    "unlabelled_rows_declared_certain",
+)
 
 
 def level_gate_scope(
@@ -147,11 +156,21 @@ def level_gate_scope(
     return True, None
 
 
-def level_basis(route: Optional[str]) -> str:
-    """What a policy's reported level rests on, from its point route."""
-    return {"direct_oracle": "oracle", "augmented": "residual_corrected"}.get(
-        str(route), "calibration_map"
-    )
+def level_basis(route: Optional[str], check: Optional[Mapping[str, Any]] = None) -> str:
+    """What a policy's reported level rests on, by the gates' own rule.
+
+    ``"oracle"`` for a complete-oracle mean and ``"residual_corrected"`` for
+    an augmented policy whose correction design check passed. Every other
+    policy is ``"calibration_map"``: plug-in routes, and augmented policies
+    whose check failed or was not recorded, because ``level_gate_scope``
+    keeps the calibration-map gates on their level.
+    """
+    scope = level_gate_scope(route, check)[1]
+    if scope == "direct_oracle":
+        return "oracle"
+    if scope == "residual_corrected":
+        return "residual_corrected"
+    return "calibration_map"
 
 
 def correction_design_check(
@@ -168,20 +187,26 @@ def correction_design_check(
     ``CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS`` effective labelled prompts
     (Kish count over prompt clusters of the inverse-propensity weights), a
     known-propensity design effective sample size ``N^2 / sum(1/p)`` of at
-    least the same floor, non-constant labelled outcomes, and judge-score
+    least the same floor, no unlabelled row declared certain to be labelled
+    (known propensity 1), non-constant labelled outcomes, and judge-score
     balance: the Horvitz-Thompson weighted labelled rows must reproduce the
     mean and spread of the judge score over all rows (and, under known
     propensities, the row count) within ``CORRECTION_DESIGN_BALANCE_T``
-    design standard errors.
+    design standard errors. The standard errors are prompt-cluster ones (under
+    known propensities, at least the declared row-level Poisson one), so
+    labels drawn by prompt (every draw of a sampled prompt) are graded
+    correctly.
 
     It is a falsification check, not proof: it catches labels selected by
     judge score, but not selection unrelated to the score, and it does not
     balance calibrator covariates.
 
     Returns a JSON-safe dict with ``design``, ``labelled_prompts``,
-    ``effective_labelled_prompts``, ``design_effective_n`` (None unless
-    known-propensity), ``balance_t`` ({variable: t}), ``passed`` and
-    ``failed`` (failure codes, in order).
+    ``effective_labelled_prompts``, ``design_effective_n`` and
+    ``unlabelled_certain_rows`` (both None unless known-propensity),
+    ``balance_t`` ({variable: t}; t is None when a deviation has no design
+    variance, which fails balance), ``passed`` and ``failed`` (failure codes,
+    in order).
     """
     if label_design not in ("representative", "known_propensity"):
         raise ValueError(
@@ -221,6 +246,8 @@ def correction_design_check(
     labelled_clusters = np.unique(cluster_index[mask])
     if n_labelled:
         cluster_weights = np.bincount(cluster_index, weights=weights)[labelled_clusters]
+        # Scaled by the largest weight so tiny propensities cannot overflow.
+        cluster_weights = cluster_weights / np.max(cluster_weights)
         effective = float(np.sum(cluster_weights) ** 2 / np.sum(cluster_weights**2))
     else:
         effective = 0.0
@@ -231,33 +258,54 @@ def correction_design_check(
         round(float(n_rows**2 / np.sum(1.0 / inclusion)), 9) if known else None
     )
 
+    # Under known propensities a row declared certain (p = 1) is always
+    # labelled; an unlabelled one contradicts the declared design ("1 = no
+    # reweighting" is the usual slip), and the Horvitz-Thompson correction
+    # then leaves the level close to the map's.
+    certain_unlabelled = int(np.sum((inclusion >= 1.0) & ~mask)) if known else None
+
     spread_raw = np.abs(scores - np.median(scores))
     balance_variables: Dict[str, np.ndarray] = {}
     if known:
         balance_variables["label_count"] = np.ones(n_rows, dtype=float)
     balance_variables["judge_level"] = scores - np.mean(scores)
     balance_variables["judge_spread"] = spread_raw - np.mean(spread_raw)
-    score_range = float(np.max(scores) - np.min(scores))
-    balance_t: Dict[str, float] = {}
+    # Centred deviations at float-noise size (a constant score, or a spread
+    # that is identical on every row) are exactly zero. The scale includes the
+    # score magnitude so a constant score (zero range) is covered too.
+    noise = 1e-9 * max(
+        float(np.max(scores) - np.min(scores)), float(np.max(np.abs(scores)))
+    )
+    balance_t: Dict[str, Optional[float]] = {}
+    degenerate = False
     for name, values in balance_variables.items():
         x = values
         if name != "label_count":
-            # Centred deviations at float-noise size (a constant score, or a
-            # spread that is identical on every row) are exactly zero.
-            x = np.where(np.abs(values) <= 1e-9 * score_range, 0.0, values)
+            x = np.where(np.abs(values) <= noise, 0.0, values)
         deviation = (weights - 1.0) * x
         numerator = float(np.sum(deviation))
-        if known:
-            # Poisson-sampling design variance over all rows.
-            variance = float(np.sum((1.0 - inclusion) / inclusion * x**2))
-        else:
-            # Prompt-cluster variance over all clusters.
+        # Prompt-cluster variance over all clusters, for both designs. Labels
+        # are often drawn by prompt (every draw of a sampled prompt), and a
+        # row-level variance then understates the variance by about the draws
+        # per prompt. Under known propensities the declared row-level Poisson
+        # variance is exact for row-level sampling and steadier than the
+        # cluster estimate at small label counts, so the larger of the two is
+        # used. An overflow is handled below as an unusable variance.
+        with np.errstate(over="ignore", invalid="ignore"):
             variance = float(np.sum(np.bincount(cluster_index, weights=deviation) ** 2))
-        balance_t[name] = (
-            float(numerator / np.sqrt(variance))
-            if variance > 0 and np.isfinite(variance)
-            else 0.0
-        )
+            if known:
+                poisson = float(np.sum((1.0 - inclusion) / inclusion * x**2))
+                variance = max(variance, poisson)
+        tolerance = 1e-9 * max(1.0, float(np.sum(np.abs(deviation))))
+        if variance > 0 and np.isfinite(variance) and np.isfinite(numerator):
+            balance_t[name] = float(numerator / np.sqrt(variance))
+        elif np.isfinite(numerator) and abs(numerator) <= tolerance:
+            balance_t[name] = 0.0
+        else:
+            # A deviation with no usable design variance: unbalanced, with an
+            # undefined t (None keeps the record JSON-safe).
+            balance_t[name] = None
+            degenerate = True
 
     failed: List[str] = []
     if effective < CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS:
@@ -267,15 +315,22 @@ def correction_design_check(
         and design_effective_n < CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS
     ):
         failed.append("low_design_effective_n")
+    if certain_unlabelled:
+        failed.append("unlabelled_rows_declared_certain")
     if labelled_outcomes_constant:
         failed.append("labelled_outcomes_constant")
-    if max(abs(t) for t in balance_t.values()) >= CORRECTION_DESIGN_BALANCE_T:
+    if (
+        degenerate
+        or max(abs(t) for t in balance_t.values() if t is not None)
+        >= CORRECTION_DESIGN_BALANCE_T
+    ):
         failed.append("labelled_rows_unbalanced")
     return {
         "design": str(label_design),
         "labelled_prompts": int(len(labelled_clusters)),
         "effective_labelled_prompts": float(effective),
         "design_effective_n": design_effective_n,
+        "unlabelled_certain_rows": certain_unlabelled,
         "balance_t": balance_t,
         "passed": not failed,
         "failed": failed,
@@ -289,8 +344,20 @@ def _design_words(check: Optional[Mapping[str, Any]]) -> str:
 
 def _balance_text(check: Mapping[str, Any]) -> str:
     return ", ".join(
-        f"{name} t={float(value):+.2f}"
+        (
+            f"{name} t={float(value):+.2f}"
+            if value is not None
+            else f"{name} t undefined (no design variance)"
+        )
         for name, value in (check.get("balance_t") or {}).items()
+    )
+
+
+def _certain_text(check: Mapping[str, Any]) -> str:
+    count = int(check.get("unlabelled_certain_rows") or 0)
+    return (
+        f"{count} unlabelled row{'s have' if count != 1 else ' has'} a declared "
+        "label propensity of 1 (certain to be labelled)"
     )
 
 
@@ -324,6 +391,8 @@ def correction_not_exempt_reason(check: Optional[Mapping[str, Any]]) -> str:
             f"{float(check.get('design_effective_n') or 0.0):.1f}, below "
             f"{CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS}"
         )
+    if "unlabelled_rows_declared_certain" in failed:
+        parts.append(_certain_text(check))
     if "labelled_outcomes_constant" in failed:
         parts.append("every labelled outcome is identical")
     if "labelled_rows_unbalanced" in failed:
@@ -346,14 +415,24 @@ def correction_caution(
         return None
     failed = list(check.get("failed") or [])
     sentences: List[str] = []
+    if "unlabelled_rows_declared_certain" in failed:
+        sentences.append(
+            _certain_text(check)
+            + ", which the declared design rules out: propensity 1 means a row "
+            "is always labelled, not 'no reweighting'. The Horvitz-Thompson "
+            "correction counts those rows as having zero residual, which pulls "
+            "the level toward the calibration map's. Declare the probability "
+            "with which each row was sent for labelling."
+        )
     if "labelled_rows_unbalanced" in failed:
         design = _design_words(check)
-        sentences.append(
+        text = (
             f"its labelled rows do not look like a {design} sample of its "
             f"evaluation rows ({_balance_text(check)}). The corrected estimate "
             "assumes they are; labels chosen by score, availability or "
             "difficulty can bias it in either direction."
         )
+        sentences.append(text if not sentences else "Also, " + text)
     if "low_design_effective_n" in failed:
         text = (
             "the declared label propensities give a design effective sample "
@@ -391,6 +470,13 @@ def correction_check_limitation(check: Optional[Mapping[str, Any]]) -> Optional[
     return f"residual correction design check failed ({', '.join(failed)})"
 
 
+def reused_row_count(audit: Mapping[str, Any]) -> int:
+    """Distinct labelled evaluation rows an audit's probes reuse."""
+    overlap = audit.get("probe_overlap") or {}
+    rows = overlap.get("n_reused_rows")
+    return int(rows if rows is not None else overlap.get("n_reused", 0))
+
+
 def transport_limitation(audit: Optional[Mapping[str, Any]]) -> Optional[str]:
     """Limitation text for a displayed policy's transport audit, or None."""
     if not audit:
@@ -406,9 +492,8 @@ def transport_limitation(audit: Optional[Mapping[str, Any]]) -> Optional[str]:
         else:
             parts.append(f"residual transport {status}")
     if audit.get("probes_independent") is False:
-        overlap = audit.get("probe_overlap") or {}
         parts.append(
-            f"transport probes reuse {int(overlap.get('n_reused', 0))} labelled "
+            f"transport probes reuse {reused_row_count(audit)} labelled "
             "evaluation rows (audit not independent)"
         )
     return "; ".join(parts) if parts else None

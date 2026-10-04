@@ -1354,7 +1354,8 @@ class CalibratedDirectEstimator:
         ``metadata["reliability_gates"][policy]["flagged"]``: a REFUSE-LEVEL
         coverage badge qualifies the policy's point-winner announcement when
         the policy's level depends on the calibrator. Also records
-        ``metadata["level_basis"]`` for every policy and
+        ``metadata["level_basis"]`` for every policy (an augmented policy
+        whose design check fails is ``calibration_map``) and
         ``metadata["correction_checks"]`` for augmented policies; a failed
         design check adds a gate note (never a flag).
         """
@@ -1362,7 +1363,7 @@ class CalibratedDirectEstimator:
             getattr(self, "_correction_checks", {}) or {}
         )
         metadata["level_basis"] = {
-            policy: level_basis(self._route_for_policy(policy))
+            policy: level_basis(self._route_for_policy(policy), checks.get(policy))
             for policy in self.target_policies
         }
         if checks:

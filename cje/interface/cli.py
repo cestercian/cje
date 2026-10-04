@@ -388,7 +388,7 @@ def _dir_has_logprob_fields(directory: Path) -> bool:
 
 def run_analysis(args: argparse.Namespace) -> int:
     """Run the analysis command."""
-    from ..diagnostics.gates import correction_check_limitation
+    from ..diagnostics.gates import correction_check_limitation, reused_row_count
     from .analysis import LOGGED_DATA_PATH_REMOVED_MESSAGE, analyze_dataset
 
     # Set logging level
@@ -562,12 +562,9 @@ def run_analysis(args: argparse.Namespace) -> int:
                         " (calibration map only; estimate residual-corrected)"
                     )
                 if audit.get("probes_independent") is False:
-                    n_reused = int(
-                        (audit.get("probe_overlap") or {}).get("n_reused", 0)
-                    )
                     transport_line += (
-                        f"; probes reuse {n_reused} labelled evaluation rows "
-                        "(not independent)"
+                        f"; probes reuse {reused_row_count(audit)} labelled "
+                        "evaluation rows (not independent)"
                     )
                 print(transport_line)
                 check = (results.metadata.get("correction_checks") or {}).get(policy)

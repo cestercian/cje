@@ -51,12 +51,20 @@ diagnostics = results.diagnostics
 if diagnostics.overall_status == Status.CRITICAL:
     print(diagnostics.summary())
 
-# Per-policy scalar-support badges: any REFUSE-LEVEL card means do NOT ship
-# level (absolute) claims for that policy. This check alone does not certify
-# rankings or residual transport.
+# Per-policy scalar-support badges: a REFUSE-LEVEL card whose
+# applies_to_current_estimate is true means do NOT ship level (absolute)
+# claims for that policy. An exempt card (gate_exemption "direct_oracle" or
+# "residual_corrected") describes the calibration map only; the reported
+# level does not use it. This check alone does not certify rankings or
+# residual transport.
 if diagnostics.boundary_cards:
     for policy, card in diagnostics.boundary_cards.items():
-        print(f"{policy}: {card['status']} (out-of-range={card['out_of_range']:.1%})")
+        print(
+            f"{policy}: {card['status']} "
+            f"(out-of-range={card['out_of_range']:.1%}, "
+            f"applies={card.get('applies_to_current_estimate', True)}, "
+            f"exemption={card.get('gate_exemption')})"
+        )
 ```
 
 ## Status System and Gates
@@ -212,7 +220,7 @@ No pilot data yet? `simulate_variance_model(r2=...)` builds a variance model fro
 
 ## Common Issues
 
-**"REFUSE-LEVEL" badge** — a policy's judge scores fall outside the oracle calibration range. Collect oracle labels covering that range (the warning names it); don't ship absolute numbers for that policy meanwhile.
+**"REFUSE-LEVEL" badge** — a policy's judge scores fall outside the oracle calibration range. When the card applies to the reported estimate (`applies_to_current_estimate` true; the policy is flagged and the warning names the range), collect oracle labels covering that range and don't ship absolute numbers for that policy meanwhile. A card with `applies_to_current_estimate` false (`gate_exemption` `"direct_oracle"` or `"residual_corrected"`) describes the calibration map only: the policy's level is a complete-oracle mean or is residual-corrected by labels that passed the correction design check, so it can be reported with its interval.
 
 **Transport audit FAIL** — the calibrator doesn't hold on the probe group. Collect 100–200 target-group labels and re-run with the labels pooled in; escalate to a refit with covariates if decile residuals trend with score (see PLAYBOOK Sections 3 and 5).
 

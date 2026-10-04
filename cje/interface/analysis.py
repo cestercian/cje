@@ -168,12 +168,15 @@ def analyze_dataset(
             map: complete-oracle policies are exempt, and augmented policies
             are exempt when ``metadata["correction_checks"][policy]["passed"]``
             holds (at least 20 effective labelled prompts, a known-propensity
-            design effective sample size of at least 20, non-constant labelled
-            outcomes, and judge-score balance under the declared design).
+            design effective sample size of at least 20 with no unlabelled
+            row declared at propensity 1, non-constant labelled outcomes, and
+            judge-score balance under the declared design).
             A lifted FAIL makes comparisons with unaudited map-based policies
             a warned caution (``map_offset_uncancelled``). Probes that are the
             policy's own labelled evaluation rows are kept, warned about and
-            marked ``probes_independent=False``. A probe that is exactly a
+            marked ``probes_independent=False``; without a response id or
+            text, a probe on a labelled prompt is that row only if its judge
+            score and oracle label equal the row's. A probe that is exactly a
             row used to fit the calibrator raises ``ValueError``.
 
     Returns:
@@ -854,6 +857,7 @@ def analyze_dataset(
         oracle_input_scale=fresh_oracle_public_scale,
         output_scale=result_output_scale,
         evaluation_rows=fresh_draws_dict,
+        judge_input_scale=fresh_judge_public_scale,
     )
 
     return results
@@ -870,6 +874,7 @@ def _attach_transport_audits(
     oracle_input_scale: Any,
     output_scale: Any,
     evaluation_rows: Optional[Dict[str, Any]] = None,
+    judge_input_scale: Any = None,
 ) -> None:
     """Run configured held-out probes and record every policy's audit state.
 
@@ -879,7 +884,9 @@ def _attach_transport_audits(
     evaluation datasets), probes that are the policy's own labelled
     evaluation rows are warned about and marked ``probes_independent=False``,
     and a probe that exactly matches a row that also fitted the calibrator
-    raises.
+    raises. ``judge_input_scale`` is the probes' public judge scale (default:
+    the result calibrator's), used to compare probe and row judge scores on
+    the internal unit scale.
     """
     from ..data.ingest import canonicalize_record, read_aliased_field
     from ..diagnostics import Status
@@ -968,9 +975,16 @@ def _attach_transport_audits(
             getattr(results.calibrator, "covariate_names", None) or []
         )
         probes: List[Any] = []
-        # Per probe: whether it carried its own prompt identity (not the
-        # index-fallback id) and an explicit draw_idx, for overlap matching.
-        probe_identity: List[Dict[str, bool]] = []
+        # Per probe, for overlap matching: whether it carried its own prompt
+        # identity (not the index-fallback id) and an explicit draw_idx, and
+        # its judge score and oracle label on the internal unit scale (the
+        # evaluation rows' units).
+        probe_identity: List[Dict[str, Any]] = []
+        judge_scale = (
+            judge_input_scale
+            if judge_input_scale is not None
+            else getattr(results.calibrator, "judge_scale", None)
+        )
         for index, raw_probe in enumerate(raw_probes):
             if isinstance(raw_probe, dict):
                 canonical = canonicalize_record(
@@ -1021,12 +1035,13 @@ def _attach_transport_audits(
                 prompt_keyed = object_record["prompt_id"] is not None or bool(
                     object_record["prompt"]
                 )
-            probe_identity.append(
-                {
-                    "prompt_keyed": prompt_keyed,
-                    "draw_idx_explicit": canonical.get("draw_idx") is not None,
-                }
-            )
+            identity: Dict[str, Any] = {
+                "prompt_keyed": prompt_keyed,
+                "draw_idx_explicit": canonical.get("draw_idx") is not None,
+                "judge_unit": _unit_value(canonical.get("judge_score"), judge_scale),
+                "oracle_unit": None,
+            }
+            probe_identity.append(identity)
 
             if canonical.get("oracle_label") is None:
                 raise ValueError(
@@ -1053,6 +1068,7 @@ def _attach_transport_audits(
                 oracle_input_scale,
                 field_name="transport probe oracle_label",
             )
+            identity["oracle_unit"] = _unit_value(oracle_value, oracle_input_scale)
             canonical["oracle_label"] = float(
                 output_scale.inverse(oracle_input_scale.normalize(oracle_value))
             )
@@ -1205,10 +1221,27 @@ def _attach_transport_audits(
         }
 
 
+def _unit_value(value: Any, scale: Any) -> Optional[float]:
+    """A public-unit value on the internal unit scale, or None if unusable."""
+    try:
+        number = float(value)
+        if scale is not None:
+            number = float(scale.normalize(number))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _same_value(probe_value: Optional[float], row_value: Any) -> bool:
+    if probe_value is None or row_value is None:
+        return False
+    return bool(np.isclose(probe_value, float(row_value), rtol=1e-9, atol=1e-9))
+
+
 def _probe_overlap(
     policy: str,
     probes: List[Dict[str, Any]],
-    probe_identity: List[Dict[str, bool]],
+    probe_identity: List[Dict[str, Any]],
     dataset: Optional[Any],
     fit_evaluation_keys: Set[Tuple[str, str, int]],
 ) -> Dict[str, Any]:
@@ -1218,11 +1251,17 @@ def _probe_overlap(
     that applies: equal ``observation_id``; equal explicit
     ``(source_id, row_id)``; or, only for a probe that carried its own
     prompt identity, the same ``prompt_id`` plus the first identity both
-    sides carry (``metadata["response_id"]``, then non-empty response text,
-    then ``draw_idx`` with the probe defaulting to 0). A draw-index match is
-    exact when the probe gave an explicit ``draw_idx`` or the policy has a
-    single evaluation row for that prompt; otherwise it is ambiguous. An
-    exact match with a row that also fitted the calibrator raises.
+    sides carry (``metadata["response_id"]``, then non-empty response text).
+    Without either, a row matches only when the probe's judge score and
+    oracle label equal the row's (unit scale): a new response on a labelled
+    prompt is a different observation, not a reused row. Such a value match
+    is exact when the probe's explicit ``draw_idx`` equals the row's, or when
+    the probe gave no ``draw_idx`` and the policy has a single evaluation row
+    for that prompt; otherwise it is ambiguous. An exact match with a row
+    that also fitted the calibrator raises; ambiguous matches only warn.
+
+    ``n_reused`` counts matching probes and ``n_reused_rows`` the distinct
+    labelled evaluation rows they match.
     """
     samples = list(getattr(dataset, "samples", None) or [])
     labelled = [sample for sample in samples if sample.oracle_label is not None]
@@ -1246,7 +1285,7 @@ def _probe_overlap(
         by_prompt.setdefault(str(sample.prompt_id), []).append(sample)
 
     def _match(
-        probe: Dict[str, Any], identity: Dict[str, bool]
+        probe: Dict[str, Any], identity: Dict[str, Any]
     ) -> Optional[Tuple[str, Any, bool]]:
         observation_id = probe.get("observation_id")
         if observation_id is not None and str(observation_id) in by_observation:
@@ -1259,10 +1298,13 @@ def _probe_overlap(
         prompt_id = str(probe.get("prompt_id"))
         probe_response_id = (probe.get("metadata") or {}).get("response_id")
         probe_response = probe.get("response")
-        try:
-            probe_draw = int(probe.get("draw_idx") or 0)
-        except (TypeError, ValueError):
-            probe_draw = None  # an unusable draw_idx never matches by draw
+        probe_draw: Optional[int] = None
+        if identity["draw_idx_explicit"]:
+            try:
+                probe_draw = int(probe.get("draw_idx"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                probe_draw = None  # an unusable draw_idx never matches by draw
+        same_values: List[Any] = []
         for row in by_prompt.get(prompt_id, []):
             row_response_id = (row.metadata or {}).get("response_id")
             if probe_response_id is not None and row_response_id is not None:
@@ -1273,15 +1315,25 @@ def _probe_overlap(
                 if str(probe_response) == str(row.response):
                     return "prompt_and_response_text", row, True
                 continue
+            if not (
+                _same_value(identity["judge_unit"], row.judge_score)
+                and _same_value(identity["oracle_unit"], row.oracle_label)
+            ):
+                continue
             if probe_draw is not None and probe_draw == int(row.draw_idx):
-                exact = (
-                    identity["draw_idx_explicit"]
-                    or rows_per_prompt.get(prompt_id, 0) == 1
-                )
-                return "prompt_and_draw_idx", row, exact
-        return None
+                return "prompt_and_draw_idx", row, True
+            same_values.append(row)
+        if not same_values:
+            return None
+        exact = (
+            not identity["draw_idx_explicit"]
+            and len(same_values) == 1
+            and rows_per_prompt.get(prompt_id, 0) == 1
+        )
+        return "prompt_score_and_label", same_values[0], exact
 
     kinds: Set[str] = set()
+    reused_rows: Set[Tuple[str, int]] = set()
     n_reused = n_fit = n_ambiguous = n_unkeyed = 0
     for index, (probe, identity) in enumerate(zip(probes, probe_identity)):
         if not identity["prompt_keyed"]:
@@ -1292,6 +1344,7 @@ def _probe_overlap(
         kind, row, exact = found
         kinds.add(kind)
         n_reused += 1
+        reused_rows.add((str(row.prompt_id), int(row.draw_idx)))
         if not exact:
             n_ambiguous += 1
         in_fit = (
@@ -1304,14 +1357,16 @@ def _probe_overlap(
                 f"Transport probe {index} for policy {policy!r} is the policy's "
                 f"own labelled evaluation row (prompt_id {str(row.prompt_id)!r}, "
                 f"matched by {kind}), which was also used to fit the calibrator; "
-                "probes must be held out. Supply held-out probes, or attach the "
-                "labels with combine_oracle_sources=False and an external "
-                "calibration file (guides/audit-correction.md)."
+                "probes must be held out. Supply held-out probes, give probes and "
+                "rows a response_id or response text if this probe is a new "
+                "response, or attach the labels with combine_oracle_sources=False "
+                "and an external calibration file (guides/audit-correction.md)."
             )
         if in_fit:
             n_fit += 1
     return {
         "n_reused": n_reused,
+        "n_reused_rows": len(reused_rows),
         "n_calibration_fit": n_fit,
         "n_ambiguous": n_ambiguous,
         "n_unkeyed": n_unkeyed,
@@ -1323,9 +1378,11 @@ def _warn_probe_overlap(
     policy: str, overlap: Dict[str, Any], n_probe: int, route: str
 ) -> None:
     """One WARNING for probes that reuse the policy's labelled evaluation rows."""
+    n_rows = int(overlap.get("n_reused_rows", overlap["n_reused"]))
     parts = [
         f"Transport probes for policy {policy!r}: {overlap['n_reused']} of "
-        f"{n_probe} are the policy's own labelled evaluation rows (matched by "
+        f"{n_probe} match the policy's own labelled evaluation rows ({n_rows} "
+        f"distinct row{'s' if n_rows != 1 else ''}; matched by "
         f"{', '.join(overlap['matched_by'])})."
     ]
     if route == "augmented":
@@ -1337,9 +1394,9 @@ def _warn_probe_overlap(
     if overlap["n_calibration_fit"]:
         parts.append(
             f" {overlap['n_calibration_fit']} of them may also have been used to "
-            "fit the calibrator (ambiguous match: several draws share the prompt "
-            "and the probe has no draw_idx), so the audit may be in-sample and "
-            "biased toward PASS."
+            "fit the calibrator (ambiguous match: the probe has the same prompt, "
+            "judge score and oracle label as a row that cannot be identified "
+            "exactly), so the audit may be in-sample and biased toward PASS."
         )
     parts.append(
         " The audit is kept and marked probes_independent=False; supply held-out "

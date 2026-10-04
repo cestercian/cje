@@ -27,6 +27,8 @@ from cje.diagnostics.gates import (
     CORRECTION_DESIGN_BALANCE_T,
     CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS,
     correction_design_check,
+    correction_not_exempt_reason,
+    level_basis,
 )
 from cje.interface.cli import best_policy_lines
 
@@ -410,6 +412,17 @@ def test_convenience_labels_keep_gate(
     )
     assert result.diagnostics is not None
     assert _status(result, "candidate") == Status.CRITICAL
+    assert result.metadata["level_basis"] == {
+        "baseline": "residual_corrected",
+        "candidate": "calibration_map",
+    }
+    # The design-check note is recorded, but summary() prints notes only for
+    # gates that did not flag the policy.
+    assert gate.notes == [
+        "correction design check failed (labelled_rows_unbalanced); see "
+        "metadata['correction_checks']"
+    ]
+    assert "    note: " not in result.summary()
 
     verdict = result.best_policy()
     assert verdict.name == "baseline"
@@ -530,6 +543,28 @@ def test_below_effective_floor_keeps_gate(
             f"{NOT_EXEMPT}: 19.0 effective labelled prompts (19 labelled), "
             "fewer than 20"
         )
+        # Too few labels only withholds the exemption: no design-check
+        # limitation, note or warning, with or without an audit.
+        design_limitation = "residual correction design check failed"
+        assert gate.notes == []
+        assert design_limitation not in result.summary()
+        assert not any(design_limitation in line for line in best_policy_lines(result))
+        no_audit = analyze_dataset(
+            fresh_draws_data={"candidate": rows},
+            **_external(_anchor(tmp_path, seed=5)),
+        )
+        assert no_audit.metadata["correction_checks"]["candidate"]["failed"] == [
+            "too_few_effective_labelled_prompts"
+        ]
+        assert (
+            "candidate" not in (no_audit.metadata.get("reliability_gates") or {})
+            or not no_audit.gates["candidate"].notes
+        )
+        assert design_limitation not in no_audit.summary()
+        assert best_policy_lines(no_audit) == [
+            "Best by point estimate: candidate",
+            "Limitations: residual transport NOT_CHECKED",
+        ]
 
 
 def test_constant_labelled_outcomes_keep_gate(
@@ -660,6 +695,53 @@ def test_plug_in_routes_unchanged(tmp_path: Path, case: str, route: str) -> None
     ]
 
 
+def test_transport_fail_does_not_gate_direct_oracle(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A complete-oracle mean ignores a map FAIL on its held-out probes."""
+    rng = np.random.default_rng(79)
+    n = 200
+    scores = rng.uniform(0.2, 0.6, n)
+    draws = {
+        "oracle": _rows(
+            scores,
+            np.ones(n, dtype=bool),
+            lambda s: 0.2 + 0.5 * s + 0.1 + rng.normal(0, 0.02),
+            prefix="o",
+        ),
+        "baseline": _rows(
+            rng.uniform(0.2, 0.6, n), np.zeros(n, dtype=bool), lambda s: 0.0
+        ),
+    }
+    probes = {"oracle": _probes(rng, "oracle", shift=0.1)}
+    with caplog.at_level(logging.WARNING):
+        result = analyze_dataset(
+            fresh_draws_data=draws,
+            transport=_transport(probes),
+            **_external(_anchor(tmp_path, seed=79)),
+        )
+
+    index = result.target_policies.index("oracle")
+    assert result.metadata["point_estimator"]["routes"][index] == "direct_oracle"
+    assert result.metadata["level_basis"]["oracle"] == "oracle"
+    audit = result.metadata["transport_audits"]["oracle"]
+    assert audit["status"] == "FAIL"
+    assert audit["route"] == "direct_oracle"
+    assert audit["applies_to_current_estimate"] is False
+    assert audit["gate_exemption"] == "direct_oracle"
+    gates = result.metadata.get("reliability_gates") or {}
+    assert not (gates.get("oracle") or {}).get("flagged", False)
+    assert not (gates.get("oracle") or {}).get("refuse_level_claims", False)
+    assert "oracle" not in result._unreliable_policies()
+    assert _status(result, "oracle") == Status.GOOD
+    verdict = result.best_policy()
+    assert verdict.name == "oracle"
+    assert verdict.runner_up is None
+    assert not any(
+        "best_policy()" in message for message in _messages(caplog, logging.WARNING)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Known-propensity designs
 # ---------------------------------------------------------------------------
@@ -761,6 +843,162 @@ def test_known_propensity_misdeclared_is_caught(tmp_path: Path) -> None:
     assert result.gates["candidate"].flagged is True
 
 
+def test_known_propensity_certain_unlabelled_rows_keep_gate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Propensity 1 on every row ("no reweighting") with 40 random labels.
+
+    Propensity 1 means "always labelled", so the 260 unlabelled rows
+    contradict the design, and the correction stays near the map's level.
+    """
+    rng = np.random.default_rng(67)
+    n = 300
+    scores = rng.uniform(0.2, 0.6, n)
+    observed = np.zeros(n, dtype=bool)
+    observed[rng.choice(n, 40, replace=False)] = True
+    rows = _rows(scores, observed, lambda s: 0.2 + 0.5 * s + 0.1 + rng.normal(0, 0.02))
+    with caplog.at_level(logging.INFO):
+        result = _single_policy_fail(
+            tmp_path,
+            rows,
+            label_design="known_propensity",
+            label_propensities={"candidate": [1.0] * n},
+        )
+
+    check = result.metadata["correction_checks"]["candidate"]
+    assert check["design_effective_n"] == n
+    assert check["effective_labelled_prompts"] == 40
+    assert check["unlabelled_certain_rows"] == 260
+    assert check["failed"] == [
+        "unlabelled_rows_declared_certain",
+        "labelled_rows_unbalanced",
+    ]
+    assert check["balance_t"]["label_count"] < -CORRECTION_DESIGN_BALANCE_T
+    assert result.metadata["level_basis"] == {"candidate": "calibration_map"}
+
+    audit = result.metadata["transport_audits"]["candidate"]
+    assert audit["status"] == "FAIL"
+    assert audit["applies_to_current_estimate"] is True
+    assert audit["gate_exemption"] is None
+    gate = result.gates["candidate"]
+    assert gate.flagged is True
+    assert gate.refuse_level_claims is True
+    assert gate.reasons[-1].startswith(
+        f"{NOT_EXEMPT}: 260 unlabelled rows have a declared label propensity of 1 "
+        "(certain to be labelled); labelled rows do not match the declared "
+        "known-propensity design"
+    )
+    assert _status(result, "candidate") == Status.CRITICAL
+    design_warnings = [
+        m for m in _messages(caplog, logging.WARNING) if m.startswith(DESIGN_WARNING)
+    ]
+    assert len(design_warnings) == 1
+    assert design_warnings[0].startswith(
+        "Residual correction for policy 'candidate': 260 unlabelled rows have a "
+        "declared label propensity of 1 (certain to be labelled), which the "
+        "declared design rules out"
+    )
+
+    # Propensity 1 on the labelled rows only is a valid declaration.
+    unit = correction_design_check(
+        scores,
+        observed,
+        np.arange(n),
+        "known_propensity",
+        propensities=np.where(observed, 1.0, 0.1),
+    )
+    assert unit["unlabelled_certain_rows"] == 0
+    assert "unlabelled_rows_declared_certain" not in unit["failed"]
+
+
+def _whole_prompt_rows(
+    seed: int, *, draws: int = 4, propensity: float = 0.25, n_prompts: int = 150
+) -> List[Dict[str, Any]]:
+    """Known-propensity design that labels every draw of a sampled prompt."""
+    rng = np.random.default_rng(seed)
+    prompts = [f"q{j}" for j in range(n_prompts) for _ in range(draws)]
+    scores = np.clip(
+        np.repeat(rng.uniform(0.2, 0.6, n_prompts), draws)
+        + rng.normal(0, 0.03, n_prompts * draws),
+        0.2,
+        0.6,
+    )
+    sampled = np.repeat(rng.uniform(size=n_prompts) < propensity, draws)
+    rows = _rows(
+        scores,
+        sampled,
+        lambda s: 0.2 + 0.5 * s + 0.1 + rng.normal(0, 0.02),
+        prompt_ids=prompts,
+    )
+    for i, row in enumerate(rows):
+        row["draw_idx"] = i % draws
+    return rows
+
+
+def test_known_propensity_whole_prompt_labels_are_exempt(tmp_path: Path) -> None:
+    """Prompt-level sampling, 4 draws each, correctly declared p = 0.25.
+
+    A row-level Poisson variance gave judge_level t = -3.09 here (34 effective
+    labelled prompts) and kept the gate; the cluster variance does not.
+    """
+    rows = _whole_prompt_rows(9)
+    rng = np.random.default_rng(9)
+    probes = _probes(rng, "candidate", shift=0.1)
+    result = analyze_dataset(
+        fresh_draws_data={"candidate": rows},
+        transport=_transport({"candidate": probes}),
+        **_external(
+            _anchor(tmp_path, seed=5),
+            label_design="known_propensity",
+            label_propensities={"candidate": [0.25] * len(rows)},
+        ),
+    )
+
+    check = result.metadata["correction_checks"]["candidate"]
+    assert check["effective_labelled_prompts"] == pytest.approx(34.0)
+    assert check["passed"] is True
+    assert max(abs(t) for t in check["balance_t"].values()) < 2.0
+    assert result.metadata["transport_audits"]["candidate"]["status"] == "FAIL"
+    assert result.gates["candidate"].flagged is False
+    assert result.gates["candidate"].exemption == "residual_corrected"
+
+
+@pytest.mark.parametrize("prompt_level", [True, False], ids=["prompts", "rows"])
+@pytest.mark.parametrize("draws", [2, 4])
+def test_known_propensity_balance_false_fail_rate(
+    draws: int, prompt_level: bool
+) -> None:
+    """Correct known propensities rarely fail balance, whole prompts or rows.
+
+    A row-level Poisson variance failed 7% (2 draws) and 27% (4 draws) of
+    whole-prompt designs; the cluster variance stays near 1%.
+    """
+    n_prompts, propensity = 150, 0.25
+    clusters = np.repeat(np.arange(n_prompts), draws)
+    failures = 0
+    for seed in range(200):
+        rng = np.random.default_rng([seed, draws])
+        scores = np.clip(
+            0.7 * np.repeat(rng.uniform(size=n_prompts), draws)
+            + 0.3 * rng.uniform(size=n_prompts * draws),
+            0,
+            1,
+        )
+        if prompt_level:
+            observed = np.repeat(rng.uniform(size=n_prompts) < propensity, draws)
+        else:
+            observed = rng.uniform(size=n_prompts * draws) < propensity
+        check = correction_design_check(
+            scores,
+            observed,
+            clusters,
+            "known_propensity",
+            propensities=np.full(len(scores), propensity),
+        )
+        failures += "labelled_rows_unbalanced" in check["failed"]
+    assert failures <= 6
+
+
 @pytest.mark.slow
 def test_design_check_false_positive_rate() -> None:
     """Random representative labels at the floor rarely fail balance."""
@@ -797,6 +1035,72 @@ def test_design_check_is_json_safe_and_deterministic() -> None:
     assert check["failed"] == ["labelled_rows_unbalanced"]
     with pytest.raises(ValueError, match="label_design"):
         correction_design_check(scores, observed, np.arange(30), "targeted_unknown")
+
+
+@pytest.mark.parametrize(
+    "case", ["two_point_0.3_0.7", "two_point_0.1_0.9", "constant", "constant_kp"]
+)
+def test_design_check_float_noise_guard(case: str) -> None:
+    """Centred values that are float noise give t == 0, not a noise ratio.
+
+    A two-point symmetric judge has the same |s - median| on every row, and a
+    constant judge has no deviation at all; without the guard their t values
+    are ratios of rounding noise (judge_spread t = -0.77 for the first case).
+    """
+    rng = np.random.default_rng(71)
+    n = 300
+    if case.startswith("two_point"):
+        lo, hi = (float(v) for v in case.split("_")[2:])
+        scores = np.r_[np.full(n // 2, lo), np.full(n // 2, hi)]
+        variables = ["judge_spread"]
+    else:
+        scores = np.full(n, 0.1)
+        variables = ["judge_level", "judge_spread"]
+    observed = np.zeros(n, dtype=bool)
+    observed[rng.choice(n, 37, replace=False)] = True
+    options: Dict[str, Any] = {}
+    design = "representative"
+    if case == "constant_kp":
+        design = "known_propensity"
+        options["propensities"] = np.full(n, 0.13)
+    check = correction_design_check(scores, observed, np.arange(n), design, **options)
+    for variable in variables:
+        assert check["balance_t"][variable] == 0.0
+    assert "labelled_rows_unbalanced" not in check["failed"]
+    assert check["passed"] is True
+
+
+def test_design_check_without_design_variance_fails_balance() -> None:
+    """A deviation whose design variance overflows is unbalanced, t None."""
+    rng = np.random.default_rng(73)
+    n = 300
+    scores = rng.uniform(0.2, 0.6, n)
+    observed = np.zeros(n, dtype=bool)
+    observed[rng.choice(n, 40, replace=False)] = True
+    propensities = np.full(n, 0.2)
+    propensities[np.flatnonzero(observed)[0]] = 1e-200
+    check = correction_design_check(
+        scores, observed, np.arange(n), "known_propensity", propensities=propensities
+    )
+    assert check["balance_t"]["label_count"] is None
+    assert "labelled_rows_unbalanced" in check["failed"]
+    assert check["effective_labelled_prompts"] == 1.0
+    # Strict JSON (no NaN or Infinity).
+    assert json.loads(json.dumps(check, allow_nan=False)) == check
+    reason = correction_not_exempt_reason(check)
+    assert "label_count t undefined (no design variance)" in reason
+
+
+def test_level_basis_follows_gate_scope() -> None:
+    passed = {"passed": True, "failed": []}
+    failed = {"passed": False, "failed": ["labelled_rows_unbalanced"]}
+    assert level_basis("direct_oracle") == "oracle"
+    assert level_basis("augmented", passed) == "residual_corrected"
+    assert level_basis("augmented", failed) == "calibration_map"
+    assert level_basis("augmented", None) == "calibration_map"
+    assert level_basis("plug_in", passed) == "calibration_map"
+    assert level_basis("plug_in_targeted_unknown") == "calibration_map"
+    assert level_basis(None) == "calibration_map"
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1420,70 @@ def test_mixed_basis_caution_negative_cases(
     assert not any("map-based" in line for line in best_policy_lines(result))
 
 
+def test_mixed_basis_caution_includes_failed_correction(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An augmented policy whose design check fails is map-based for rankings."""
+    rng = np.random.default_rng(83)
+    path = _anchor(tmp_path, seed=83)
+    n = 300
+    prompts = [f"q{i}" for i in range(n)]
+    draws: Dict[str, List[Dict[str, Any]]] = {}
+    for policy, labels in (
+        ("corrected", "random"),
+        ("low_labels", "lowest"),
+        ("base", ""),
+    ):
+        scores = rng.uniform(0.2, 0.6, n)
+        mask = np.zeros(n, dtype=bool)
+        if labels == "random":
+            mask[rng.choice(n, 60, replace=False)] = True
+        elif labels == "lowest":
+            mask[np.argsort(scores)[:60]] = True
+        draws[policy] = _rows(
+            scores,
+            mask,
+            lambda s: 0.2 + 0.5 * s + 0.06 + rng.normal(0, 0.025),
+            prompt_ids=prompts,
+        )
+    probes = {"corrected": _probes(rng, "corrected", shift=0.06)}
+    result = analyze_dataset(
+        fresh_draws_data=draws, transport=_transport(probes), **_external(path)
+    )
+
+    checks = result.metadata["correction_checks"]
+    assert checks["corrected"]["passed"] is True
+    assert "labelled_rows_unbalanced" in checks["low_labels"]["failed"]
+    assert result.metadata["level_basis"] == {
+        "base": "calibration_map",
+        "corrected": "residual_corrected",
+        "low_labels": "calibration_map",
+    }
+    audits = result.metadata["transport_audits"]
+    assert audits["corrected"]["gate_exemption"] == "residual_corrected"
+    assert audits["low_labels"]["status"] == "NOT_CHECKED"
+    assert not result._unreliable_policies()
+
+    index = result.target_policies.index
+    with caplog.at_level(logging.WARNING, logger="cje.data.models"):
+        comparison = result.compare_policies(index("corrected"), index("low_labels"))
+    assert comparison["map_offset_uncancelled"] == ["low_labels"]
+    assert any(
+        "'low_labels' rests on the calibration map" in m
+        for m in _messages(caplog, logging.WARNING)
+    )
+    assert result.compare_policies(index("corrected"), index("base"))[
+        "map_offset_uncancelled"
+    ] == ["base"]
+    assert "map_offset_uncancelled" not in result.compare_policies(
+        index("low_labels"), index("base")
+    )
+    assert result.best_policy().name == "corrected"
+    limitation = "ranking against map-based 'base', 'low_labels' not established"
+    assert limitation in result.summary()
+    assert limitation in best_policy_lines(result)[1]
+
+
 # ---------------------------------------------------------------------------
 # Probes that reuse labelled evaluation rows
 # ---------------------------------------------------------------------------
@@ -1136,6 +1504,7 @@ def test_probe_overlap_with_correction_labels_warns_and_marks(
     for policy in ("baseline", "candidate"):
         assert audits[policy]["probe_overlap"] == {
             "n_reused": 60,
+            "n_reused_rows": 60,
             "n_calibration_fit": 0,
             "n_ambiguous": 0,
             "n_unkeyed": 0,
@@ -1200,7 +1569,7 @@ def test_probe_in_calibration_fit_by_key_raises(
             transport=config,
         )
     assert "combine_oracle_sources=False" in str(raised.value)
-    assert "matched by prompt_and_draw_idx" in str(raised.value)
+    assert "matched by prompt_score_and_label" in str(raised.value)
 
     # The guide's route: external map, labels attached for correction only.
     with caplog.at_level(logging.WARNING):
@@ -1212,7 +1581,7 @@ def test_probe_in_calibration_fit_by_key_raises(
     overlap = result.metadata["transport_audits"]["policy"]["probe_overlap"]
     assert overlap["n_reused"] == 60
     assert overlap["n_calibration_fit"] == 0
-    assert overlap["matched_by"] == ["prompt_and_draw_idx"]
+    assert overlap["matched_by"] == ["prompt_score_and_label"]
     assert any(
         m.startswith("Transport probes for policy 'policy'")
         for m in _messages(caplog, logging.WARNING)
@@ -1244,6 +1613,100 @@ def test_probe_overlap_ambiguous_warns(caplog: pytest.LogCaptureFixture) -> None
     )
     assert "may also have been used to fit the calibrator" in message
     assert "biased toward PASS" in message
+
+
+@pytest.mark.parametrize(
+    "case, route",
+    [
+        ("augmented", "augmented"),
+        ("plug_in", "plug_in"),
+        ("targeted_unknown", "plug_in_targeted_unknown"),
+        ("augmented_external", "augmented"),
+        ("explicit_draw_idx", "augmented"),
+    ],
+)
+def test_new_responses_on_labelled_prompts_are_independent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, case: str, route: str
+) -> None:
+    """Probes that are new responses for labelled prompts are held out.
+
+    One draw per prompt; each probe has a labelled prompt's id but its own
+    judge score and oracle label, and no response id or text. It is not the
+    evaluation row, so it neither raises (the labels fitted the calibrator
+    unless the fit is external) nor marks the audit dependent.
+    """
+    data = _fresh_only()
+    rng = np.random.default_rng(89)
+    probes = []
+    for row, labelled in zip(data["rows"], data["labelled"]):
+        if labelled:
+            score = float(rng.uniform(0.2, 0.6))
+            probe = {
+                "prompt_id": row["prompt_id"],
+                "judge_score": score,
+                "oracle_label": float(0.2 + 0.5 * score + rng.normal(0, 0.02)),
+            }
+            if case == "explicit_draw_idx":
+                probe["draw_idx"] = 0
+            probes.append(probe)
+    options: Dict[str, Any] = {
+        "estimator_config": {"inference_method": "cluster_robust"}
+    }
+    if case == "plug_in":
+        options["estimator_config"]["use_augmented_estimator"] = False
+    if case == "targeted_unknown":
+        options["label_design"] = "targeted_unknown"
+    if case == "augmented_external":
+        options = _external(_anchor(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        result = analyze_dataset(
+            fresh_draws_data={"policy": data["rows"]},
+            transport=_transport({"policy": probes}),
+            **options,
+        )
+
+    assert result.metadata["point_estimator"]["routes"] == [route]
+    audit = result.metadata["transport_audits"]["policy"]
+    assert audit["probe_overlap"]["n_reused"] == 0
+    assert audit["probe_overlap"]["n_reused_rows"] == 0
+    assert audit["probes_independent"] is True
+    assert not any(
+        m.startswith("Transport probes for policy")
+        for m in _messages(caplog, logging.WARNING)
+    )
+    assert "reuse" not in result.summary()
+
+
+def test_duplicate_probes_count_distinct_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each labelled row supplied twice: 120 matching probes, 60 rows reused."""
+    data = _fresh_only()
+    probes = [
+        {key: row[key] for key in ("prompt_id", "judge_score", "oracle_label")}
+        for row, labelled in zip(data["rows"], data["labelled"])
+        if labelled
+    ]
+    with caplog.at_level(logging.WARNING):
+        result = analyze_dataset(
+            fresh_draws_data={"policy": data["rows"]},
+            transport=_transport({"policy": probes + probes}),
+            **_external(_anchor(tmp_path)),
+        )
+    overlap = result.metadata["transport_audits"]["policy"]["probe_overlap"]
+    assert overlap["n_reused"] == 120
+    assert overlap["n_reused_rows"] == 60
+    message = next(
+        m
+        for m in _messages(caplog, logging.WARNING)
+        if m.startswith("Transport probes for policy 'policy'")
+    )
+    assert message.startswith(
+        "Transport probes for policy 'policy': 120 of 120 match the policy's own "
+        "labelled evaluation rows (60 distinct rows; matched by "
+        "prompt_score_and_label)."
+    )
+    assert "transport probes reuse 60 labelled evaluation rows" in result.summary()
 
 
 def _key_rule_rows(
@@ -1379,6 +1842,25 @@ def test_probe_overlap_key_rules(
     assert audit["probe_overlap"]["n_reused"] == 0
     assert audit["probe_overlap"]["n_unkeyed"] == len(probes)
     assert audit["probes_independent"] is True
+
+    # (g) Same prompt and values but a different explicit draw_idx: the row
+    # cannot be identified exactly, so the match is ambiguous (never raises).
+    rows = _key_rule_rows()
+    audit = _overlap_for(tmp_path, rows, labelled_copies(rows, draw_idx=1))
+    assert audit["probe_overlap"]["n_reused"] == 40
+    assert audit["probe_overlap"]["n_ambiguous"] == 40
+    assert audit["probe_overlap"]["matched_by"] == ["prompt_score_and_label"]
+
+    # (h) Same prompt and explicit draw_idx, but a different judge score or
+    # oracle label: a different observation, not the row.
+    for field in ("judge_score", "oracle_label"):
+        audit = _overlap_for(
+            tmp_path,
+            rows,
+            labelled_copies(rows, draw_idx=0, **{field: lambda r: r[field] / 2}),
+        )
+        assert audit["probe_overlap"]["n_reused"] == 0
+        assert audit["probes_independent"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1528,3 +2010,60 @@ def test_cli_marks_exempt_audit_and_failed_design_check(
     )
     assert "    residual transport: NOT_CHECKED\n" in out
     assert "Best by point estimate: " in out
+
+
+def test_cli_marks_probe_reuse(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two draws per prompt, probes are draw-0 labelled rows without draw_idx.
+
+    The match is ambiguous, so the run proceeds; the CLI marks the audit as
+    not independent with the distinct reused-row count.
+    """
+    import sys
+
+    from cje.interface.cli import main
+
+    data = _fresh_only(n_prompts=150, draws=2)
+    directory = tmp_path / "responses"
+    directory.mkdir()
+    (directory / "policy_responses.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in data["rows"])
+    )
+    probes = [
+        {key: row[key] for key in ("prompt_id", "judge_score", "oracle_label")}
+        for row, labelled in zip(data["rows"][::2], data["labelled"][::2])
+        if labelled
+    ]
+    probe_path = tmp_path / "policy_probe.jsonl"
+    probe_path.write_text("".join(json.dumps(row) + "\n" for row in probes))
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cje",
+            "analyze",
+            str(directory),
+            "--transport-probe",
+            f"policy={probe_path}",
+            "--transport-margin",
+            "policy=0.05",
+            "--estimator-config",
+            '{"inference_method": "cluster_robust"}',
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    status_line = next(
+        line for line in out.splitlines() if line.startswith("    residual transport:")
+    )
+    assert status_line.endswith(
+        f"; probes reuse {len(probes)} labelled evaluation rows (not independent)"
+    )
+    assert (
+        f"transport probes reuse {len(probes)} labelled evaluation rows "
+        "(audit not independent)" in out
+    )
