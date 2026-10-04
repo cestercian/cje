@@ -2,7 +2,7 @@
 
 import logging
 import json
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import date, datetime, time
 from enum import Enum
 from html import escape
@@ -75,13 +75,19 @@ class GateResult:
     """Typed view of one policy's reliability gate.
 
     Derived from ``metadata["reliability_gates"]`` (the source of truth this
-    release) via ``EstimationResult.gates``.
+    release) via ``EstimationResult.gates``. ``notes`` records findings that
+    did not flag the policy (a calibration-map finding on a residual-corrected
+    estimate, or a failed correction design check); ``exemption`` is
+    ``"residual_corrected"`` when a map gate (transport FAIL or REFUSE-LEVEL
+    badge) was lifted because the level is residual-corrected.
     """
 
     policy: str
     flagged: bool
     refuse_level_claims: bool
     reasons: List[str]
+    notes: List[str] = field(default_factory=list)
+    exemption: Optional[str] = None
 
 
 @dataclass
@@ -353,6 +359,12 @@ class EstimationResult(BaseModel):
                 flagged=bool(info.get("flagged", False)),
                 refuse_level_claims=bool(info.get("refuse_level_claims", False)),
                 reasons=[str(r) for r in (info.get("reasons") or [])],
+                notes=[str(n) for n in (info.get("notes") or [])],
+                exemption=(
+                    str(info["exemption"])
+                    if info.get("exemption") is not None
+                    else None
+                ),
             )
         return gates
 
@@ -482,6 +494,55 @@ class EstimationResult(BaseModel):
                 if value == "critical":
                     flagged.add(policy)
         return flagged
+
+    def _map_offset_exposure(self) -> Tuple[List[str], List[str]]:
+        """Policies with a lifted transport FAIL, and map-exposed policies.
+
+        A lifted FAIL is a residual-transport FAIL on a policy whose
+        residual-corrected level is exempt from it. A map-exposed policy's
+        level rests on the calibration map, it is not already unreliable, and
+        its own residual audit did not PASS. Both lists are empty unless some
+        FAIL was lifted.
+        """
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        audits = metadata.get("transport_audits") or {}
+        basis = metadata.get("level_basis") or {}
+        policies = self.target_policies
+        lifted = [
+            policy
+            for policy in policies
+            if (audits.get(policy) or {}).get("status") == "FAIL"
+            and (audits.get(policy) or {}).get("gate_exemption") == "residual_corrected"
+        ]
+        if not lifted:
+            return [], []
+        unreliable = self._unreliable_policies()
+        exposed = [
+            policy
+            for policy in policies
+            if basis.get(policy) == "calibration_map"
+            and policy not in unreliable
+            and (audits.get(policy) or {}).get("status", "NOT_CHECKED") != "PASS"
+        ]
+        return lifted, exposed
+
+    def _ranking_basis_limitation(self, display: str) -> Optional[str]:
+        """Limitation for a winner whose ranking mixes level bases, or None."""
+        lifted, exposed = self._map_offset_exposure()
+        if display in lifted and exposed:
+            return (
+                "ranking against map-based "
+                f"{', '.join(map(repr, exposed))} not established (the "
+                "calibration map failed its residual audit for "
+                f"{display!r}; that offset does not cancel against a "
+                "map-based level)"
+            )
+        if display in exposed and lifted:
+            return (
+                f"{display!r} rests on a calibration map that failed its "
+                f"residual audit for {', '.join(map(repr, lifted))}"
+            )
+        return None
 
     def _flagged_reasons(self, policy: str) -> List[str]:
         """Why ``policy`` failed the reliability gates (for loud demotions)."""
@@ -619,10 +680,15 @@ class EstimationResult(BaseModel):
             flag = ""
             if gate is not None and gate.flagged:
                 flag = "  [gate: FLAGGED]"
+            elif gate is not None and gate.exemption == "residual_corrected":
+                flag = "  [corrected: map gates not applied]"
             lines.append(
                 f"  {policy:<{width}s}  {self.estimates[i]:.3f}  "
                 f"95% CI [{ci_lower[i]:.3f}, {ci_upper[i]:.3f}]{flag}"
             )
+            if gate is not None and not gate.flagged:
+                for note in gate.notes:
+                    lines.append(f"    note: {note}")
 
         try:
             verdict = self.best_policy()
@@ -642,11 +708,20 @@ class EstimationResult(BaseModel):
                 )
             if self.metadata.get("calibration_status") == "UNCALIBRATED":
                 limitations.append("UNCALIBRATED raw judge-score mean")
+            from ..diagnostics.gates import (
+                correction_check_limitation,
+                transport_limitation,
+            )
+
             audit = (self.metadata.get("transport_audits") or {}).get(display, {})
-            if audit and audit.get("status") != "PASS":
-                limitations.append(
-                    f"residual transport {audit.get('status', 'NOT_CHECKED')}"
-                )
+            checks = self.metadata.get("correction_checks") or {}
+            for limitation in (
+                transport_limitation(audit),
+                self._ranking_basis_limitation(display),
+                correction_check_limitation(checks.get(display)),
+            ):
+                if limitation:
+                    limitations.append(limitation)
             lines.append(f"Best by point estimate: {display}")
             if limitations:
                 lines.append("Limitations: " + "; ".join(limitations))
@@ -720,7 +795,11 @@ class EstimationResult(BaseModel):
             inherits that unreliability, however honest the SE); paths 1-2
             add ``ci_lower``/``ci_upper``/``alpha`` (plus ``n_replicates``
             for the bootstrap path and ``df``/``basis`` for the analytic
-            path).
+            path). ``map_offset_uncancelled`` (the map-based policy) is
+            added, with a warning, when one policy's residual-transport FAIL
+            was lifted because its level is residual-corrected and the other
+            policy's level rests on that map without a PASS audit: the map
+            offset does not cancel in that difference.
         """
         n_policies = len(self.estimates)
         for name, index in (
@@ -848,6 +927,40 @@ class EstimationResult(BaseModel):
                 "comparison per the gates discipline.",
                 ", ".join(repr(p) for p in flagged),
             )
+        return self._annotate_level_basis(result, idx1, idx2)
+
+    def _annotate_level_basis(
+        self, result: Dict[str, Any], idx1: int, idx2: int
+    ) -> Dict[str, Any]:
+        """Caution a corrected-vs-map-based pair after a lifted transport FAIL.
+
+        When one policy's FAIL was lifted because its level is residual-
+        corrected and the other policy's level rests on the same calibration
+        map (not audited to PASS), a shared map offset does not cancel in the
+        difference. Adds ``map_offset_uncancelled`` ([the map-based policy])
+        and warns; otherwise adds no key. Never demotes either policy.
+        """
+        policies = self.target_policies
+        if not (0 <= idx1 < len(policies) and 0 <= idx2 < len(policies)):
+            return result
+        lifted, exposed = self._map_offset_exposure()
+        first, second = policies[idx1], policies[idx2]
+        pair: Optional[Tuple[str, str]] = None
+        if first in lifted and second in exposed:
+            pair = (first, second)
+        elif second in lifted and first in exposed:
+            pair = (second, first)
+        if pair is None:
+            return result
+        corrected, map_based = pair
+        result["map_offset_uncancelled"] = [map_based]
+        logger.warning(
+            f"compare_policies: {corrected!r} is residual-corrected but "
+            f"{map_based!r} rests on the calibration map, which failed its "
+            f"residual audit for {corrected!r}; a shared map offset does not "
+            "cancel in this difference, so its sign is not established until "
+            f"{map_based!r} is audited (PASS) or corrected."
+        )
         return result
 
     def _compare_paired_bootstrap(
@@ -1330,6 +1443,7 @@ class EstimationResult(BaseModel):
                         continue
                     comparison = dict(comparison)
                     comparison.pop("gate_flagged", None)
+                    comparison.pop("map_offset_uncancelled", None)
                     comparisons[pair_key] = comparison
             if comparisons or recomputable_pairs:
                 pairwise_state = {

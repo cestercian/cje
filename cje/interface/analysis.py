@@ -11,7 +11,7 @@ metadata.
 import logging
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -163,6 +163,18 @@ def analyze_dataset(
             use the same public judge/oracle units and field names as this
             call. Policies without probes are recorded as ``NOT_CHECKED``;
             probes without a declared per-policy margin are ``NOT_GRADED``.
+            A FAIL flags a policy, sets CRITICAL and drops it from
+            ``best_policy()`` only when its level depends on the calibration
+            map: complete-oracle policies are exempt, and augmented policies
+            are exempt when ``metadata["correction_checks"][policy]["passed"]``
+            holds (at least 20 effective labelled prompts, a known-propensity
+            design effective sample size of at least 20, non-constant labelled
+            outcomes, and judge-score balance under the declared design).
+            A lifted FAIL makes comparisons with unaudited map-based policies
+            a warned caution (``map_offset_uncancelled``). Probes that are the
+            policy's own labelled evaluation rows are kept, warned about and
+            marked ``probes_independent=False``. A probe that is exactly a
+            row used to fit the calibrator raises ``ValueError``.
 
     Returns:
         EstimationResult with estimates, standard errors, and metadata.
@@ -841,6 +853,7 @@ def analyze_dataset(
         oracle_field=oracle_field,
         oracle_input_scale=fresh_oracle_public_scale,
         output_scale=result_output_scale,
+        evaluation_rows=fresh_draws_dict,
     )
 
     return results
@@ -856,10 +869,25 @@ def _attach_transport_audits(
     oracle_field: str,
     oracle_input_scale: Any,
     output_scale: Any,
+    evaluation_rows: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Run configured held-out probes and record every policy's audit state."""
-    from ..data.ingest import canonicalize_record
+    """Run configured held-out probes and record every policy's audit state.
+
+    A FAIL gates a policy only when its level depends on the calibration map
+    (``level_gate_scope``); for an exempt residual-corrected policy it is
+    recorded with a note instead. With ``evaluation_rows`` (the per-policy
+    evaluation datasets), probes that are the policy's own labelled
+    evaluation rows are warned about and marked ``probes_independent=False``,
+    and a probe that exactly matches a row that also fitted the calibrator
+    raises.
+    """
+    from ..data.ingest import canonicalize_record, read_aliased_field
     from ..diagnostics import Status
+    from ..diagnostics.gates import (
+        corrected_gate_note,
+        correction_not_exempt_reason,
+        level_gate_scope,
+    )
     from ..diagnostics.transport import TransportAuditConfig, audit_transportability
 
     if config is not None and not isinstance(config, TransportAuditConfig):
@@ -883,6 +911,14 @@ def _attach_transport_audits(
                 used_row_ids.add((str(sample.source_id), str(sample.row_id)))
             if sample.observation_id is not None:
                 used_observation_ids.add(str(sample.observation_id))
+    # Evaluation rows that also fitted the calibrator, by (policy, prompt_id,
+    # draw_idx); probes matching one of these exactly are in-sample.
+    fit_evaluation_keys: Set[Tuple[str, str, int]] = set()
+    if calibration_dataset is not None:
+        for sample in calibration_dataset.samples:
+            key = (sample.metadata or {}).get("evaluation_key")
+            if sample.oracle_label is not None and key is not None:
+                fit_evaluation_keys.add((str(key[0]), str(key[1]), int(key[2])))
 
     def _not_checked(policy: str, reason_code: str, action: str) -> Dict[str, Any]:
         margin = config.delta_max_by_policy.get(policy) if config is not None else None
@@ -903,6 +939,7 @@ def _attach_transport_audits(
         policy: (point_routes[index] if index < len(point_routes) else "unknown")
         for index, policy in enumerate(target_policies)
     }
+    correction_checks = results.metadata.get("correction_checks") or {}
     for policy in target_policies:
         raw_probes = (
             list(config.probes_by_policy.get(policy, ())) if config is not None else []
@@ -931,6 +968,9 @@ def _attach_transport_audits(
             getattr(results.calibrator, "covariate_names", None) or []
         )
         probes: List[Any] = []
+        # Per probe: whether it carried its own prompt identity (not the
+        # index-fallback id) and an explicit draw_idx, for overlap matching.
+        probe_identity: List[Dict[str, bool]] = []
         for index, raw_probe in enumerate(raw_probes):
             if isinstance(raw_probe, dict):
                 canonical = canonicalize_record(
@@ -941,6 +981,9 @@ def _attach_transport_audits(
                     judge_field=judge_field,
                     oracle_field=oracle_field,
                 )
+                prompt_keyed = read_aliased_field(
+                    raw_probe, "prompt_id"
+                ) is not None or bool(read_aliased_field(raw_probe, "prompt"))
             else:
                 metadata = dict(getattr(raw_probe, "metadata", None) or {})
 
@@ -962,6 +1005,7 @@ def _attach_transport_audits(
                     "source_id",
                     "row_id",
                     "observation_id",
+                    "draw_idx",
                     "sample_weight",
                     *covariate_names,
                 ):
@@ -974,6 +1018,15 @@ def _attach_transport_audits(
                     source_id=f"transport_probe:{policy}",
                     policy=policy,
                 )
+                prompt_keyed = object_record["prompt_id"] is not None or bool(
+                    object_record["prompt"]
+                )
+            probe_identity.append(
+                {
+                    "prompt_keyed": prompt_keyed,
+                    "draw_idx_explicit": canonical.get("draw_idx") is not None,
+                }
+            )
 
             if canonical.get("oracle_label") is None:
                 raise ValueError(
@@ -1018,6 +1071,18 @@ def _attach_transport_audits(
 
             probes.append(canonical)
 
+        overlap = (
+            _probe_overlap(
+                policy,
+                probes,
+                probe_identity,
+                evaluation_rows.get(policy),
+                fit_evaluation_keys,
+            )
+            if evaluation_rows is not None
+            else None
+        )
+
         assert config is not None
         delta_max = config.delta_max_by_policy.get(policy)
         if delta_max is None:
@@ -1047,14 +1112,50 @@ def _attach_transport_audits(
                 family_size=config.resolved_family_size,
                 min_effective_clusters=config.min_effective_clusters,
             )
+        route = route_by_policy[policy]
+        check = correction_checks.get(policy)
+        applies, scope = level_gate_scope(route, check)
         audits[policy] = {
             **diagnostic.to_dict(),
             "performed": True,
             "graded": diagnostic.status in {"PASS", "FAIL", "INCONCLUSIVE"},
-            "applies_to_current_estimate": route_by_policy[policy] != "direct_oracle",
+            "applies_to_current_estimate": applies,
+            "gate_exemption": None if applies else scope,
+            "route": route,
+            "probe_overlap": overlap,
+            "probes_independent": (
+                None if overlap is None else overlap["n_reused"] == 0
+            ),
         }
+        if overlap is not None and overlap["n_reused"]:
+            _warn_probe_overlap(policy, overlap, len(probes), route)
 
-        if diagnostic.status == "FAIL" and route_by_policy[policy] != "direct_oracle":
+        if diagnostic.status == "FAIL" and scope == "residual_corrected":
+            # The FAIL describes the calibration map; the reported level is
+            # residual-corrected by labels that passed the design check, so it
+            # does not depend on that map. Record the finding without a flag.
+            gates = results.metadata.setdefault("reliability_gates", {})
+            gate = gates.setdefault(
+                policy,
+                {
+                    "flagged": False,
+                    "refused": False,
+                    "refuse_level_claims": False,
+                    "reasons": [],
+                },
+            )
+            gate["exemption"] = "residual_corrected"
+            notes = list(gate.get("notes") or [])
+            note = corrected_gate_note(
+                "residual transport FAIL (simultaneous CI "
+                f"[{diagnostic.delta_ci[0]:+.3f}, {diagnostic.delta_ci[1]:+.3f}] "
+                f"outside margin +/-{diagnostic.delta_max:.3f})",
+                check,
+            )
+            if note not in notes:
+                notes.append(note)
+            gate["notes"] = notes
+        elif diagnostic.status == "FAIL" and applies:
             gates = results.metadata.setdefault("reliability_gates", {})
             gate = gates.setdefault(
                 policy,
@@ -1076,6 +1177,10 @@ def _attach_transport_audits(
             )
             if reason not in reasons:
                 reasons.append(reason)
+            if scope in ("correction_not_exempt", "correction_unchecked"):
+                extra = correction_not_exempt_reason(check)
+                if extra not in reasons:
+                    reasons.append(extra)
             gate["reasons"] = reasons
             if results.diagnostics is not None:
                 # Only the audited-and-failed policy gets a status here;
@@ -1098,6 +1203,149 @@ def _attach_transport_audits(
         results.diagnostics.transport_status_per_policy = {
             policy: str(audit["status"]) for policy, audit in audits.items()
         }
+
+
+def _probe_overlap(
+    policy: str,
+    probes: List[Dict[str, Any]],
+    probe_identity: List[Dict[str, bool]],
+    dataset: Optional[Any],
+    fit_evaluation_keys: Set[Tuple[str, str, int]],
+) -> Dict[str, Any]:
+    """Count probes that are this policy's own labelled evaluation rows.
+
+    A canonical probe matches a labelled evaluation row on the first rule
+    that applies: equal ``observation_id``; equal explicit
+    ``(source_id, row_id)``; or, only for a probe that carried its own
+    prompt identity, the same ``prompt_id`` plus the first identity both
+    sides carry (``metadata["response_id"]``, then non-empty response text,
+    then ``draw_idx`` with the probe defaulting to 0). A draw-index match is
+    exact when the probe gave an explicit ``draw_idx`` or the policy has a
+    single evaluation row for that prompt; otherwise it is ambiguous. An
+    exact match with a row that also fitted the calibrator raises.
+    """
+    samples = list(getattr(dataset, "samples", None) or [])
+    labelled = [sample for sample in samples if sample.oracle_label is not None]
+    rows_per_prompt: Dict[str, int] = {}
+    for sample in samples:
+        rows_per_prompt[str(sample.prompt_id)] = (
+            rows_per_prompt.get(str(sample.prompt_id), 0) + 1
+        )
+    by_observation = {
+        str(sample.observation_id): sample
+        for sample in labelled
+        if sample.observation_id is not None
+    }
+    by_source_row = {
+        (str(sample.source_id), str(sample.row_id)): sample
+        for sample in labelled
+        if sample.source_id is not None and sample.row_id is not None
+    }
+    by_prompt: Dict[str, List[Any]] = {}
+    for sample in labelled:
+        by_prompt.setdefault(str(sample.prompt_id), []).append(sample)
+
+    def _match(
+        probe: Dict[str, Any], identity: Dict[str, bool]
+    ) -> Optional[Tuple[str, Any, bool]]:
+        observation_id = probe.get("observation_id")
+        if observation_id is not None and str(observation_id) in by_observation:
+            return "observation_id", by_observation[str(observation_id)], True
+        source_row = (str(probe.get("source_id")), str(probe.get("row_id")))
+        if source_row in by_source_row:
+            return "source_row_id", by_source_row[source_row], True
+        if not identity["prompt_keyed"]:
+            return None
+        prompt_id = str(probe.get("prompt_id"))
+        probe_response_id = (probe.get("metadata") or {}).get("response_id")
+        probe_response = probe.get("response")
+        try:
+            probe_draw = int(probe.get("draw_idx") or 0)
+        except (TypeError, ValueError):
+            probe_draw = None  # an unusable draw_idx never matches by draw
+        for row in by_prompt.get(prompt_id, []):
+            row_response_id = (row.metadata or {}).get("response_id")
+            if probe_response_id is not None and row_response_id is not None:
+                if str(probe_response_id) == str(row_response_id):
+                    return "prompt_and_response_id", row, True
+                continue
+            if probe_response and row.response:
+                if str(probe_response) == str(row.response):
+                    return "prompt_and_response_text", row, True
+                continue
+            if probe_draw is not None and probe_draw == int(row.draw_idx):
+                exact = (
+                    identity["draw_idx_explicit"]
+                    or rows_per_prompt.get(prompt_id, 0) == 1
+                )
+                return "prompt_and_draw_idx", row, exact
+        return None
+
+    kinds: Set[str] = set()
+    n_reused = n_fit = n_ambiguous = n_unkeyed = 0
+    for index, (probe, identity) in enumerate(zip(probes, probe_identity)):
+        if not identity["prompt_keyed"]:
+            n_unkeyed += 1
+        found = _match(probe, identity)
+        if found is None:
+            continue
+        kind, row, exact = found
+        kinds.add(kind)
+        n_reused += 1
+        if not exact:
+            n_ambiguous += 1
+        in_fit = (
+            str(policy),
+            str(row.prompt_id),
+            int(row.draw_idx),
+        ) in fit_evaluation_keys
+        if in_fit and exact:
+            raise ValueError(
+                f"Transport probe {index} for policy {policy!r} is the policy's "
+                f"own labelled evaluation row (prompt_id {str(row.prompt_id)!r}, "
+                f"matched by {kind}), which was also used to fit the calibrator; "
+                "probes must be held out. Supply held-out probes, or attach the "
+                "labels with combine_oracle_sources=False and an external "
+                "calibration file (guides/audit-correction.md)."
+            )
+        if in_fit:
+            n_fit += 1
+    return {
+        "n_reused": n_reused,
+        "n_calibration_fit": n_fit,
+        "n_ambiguous": n_ambiguous,
+        "n_unkeyed": n_unkeyed,
+        "matched_by": sorted(kinds),
+    }
+
+
+def _warn_probe_overlap(
+    policy: str, overlap: Dict[str, Any], n_probe: int, route: str
+) -> None:
+    """One WARNING for probes that reuse the policy's labelled evaluation rows."""
+    parts = [
+        f"Transport probes for policy {policy!r}: {overlap['n_reused']} of "
+        f"{n_probe} are the policy's own labelled evaluation rows (matched by "
+        f"{', '.join(overlap['matched_by'])})."
+    ]
+    if route == "augmented":
+        parts.append(
+            " Those labels also supply this policy's residual correction, so the "
+            "audit describes the unchanged calibration map on those rows and is "
+            "not independent validation of the corrected estimate."
+        )
+    if overlap["n_calibration_fit"]:
+        parts.append(
+            f" {overlap['n_calibration_fit']} of them may also have been used to "
+            "fit the calibrator (ambiguous match: several draws share the prompt "
+            "and the probe has no draw_idx), so the audit may be in-sample and "
+            "biased toward PASS."
+        )
+    parts.append(
+        " The audit is kept and marked probes_independent=False; supply held-out "
+        "probes for independent evidence."
+    )
+    logger.warning("".join(parts))
 
 
 def _build_label_design(

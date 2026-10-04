@@ -109,7 +109,7 @@ fallback), never by this parameter; its only observable effect is which name lan
   raw argmax with `flagged=True`. If everything is flagged, the argmax returns with
   `all_flagged=True`; do not crown it
 - `.calibrator` → fitted calibrator when calibration is required; complete oracle coverage may return `None`
-- `.metadata["transport_audits"]` → per-policy PASS / FAIL / INCONCLUSIVE / NOT_GRADED / NOT_CHECKED records when using `TransportAuditConfig`; FAIL adds a hard result gate only when the current estimate depends on that calibrator
+- `.metadata["transport_audits"]` → per-policy PASS / FAIL / INCONCLUSIVE / NOT_GRADED / NOT_CHECKED records when using `TransportAuditConfig`; FAIL adds a hard result gate only when the current estimate depends on that calibrator: plug-in routes, or an augmented route whose `metadata["correction_checks"][policy]` failed (complete-oracle policies and corrections that pass are exempt). Audited records also carry `route`, `applies_to_current_estimate`, `gate_exemption` (`"residual_corrected"` / `"direct_oracle"` / None), `probe_overlap` and `probes_independent`. `metadata["level_basis"]` gives each policy's level basis (`oracle` / `residual_corrected` / `calibration_map`); `compare_policies` adds `map_offset_uncancelled` when a corrected policy with a lifted FAIL meets an unaudited map-based one
 - `.summary()` → compact text report (per-policy estimate + 95% CI + gate flags, best-policy line)
 - `.gates` → `Dict[str, GateResult]` (typed view of `metadata["reliability_gates"]`); `.target_policies`
 - `.metadata` keys: `target_policies`, `reliability_gates` (`{policy: {"flagged": bool, ...}}`),
@@ -298,6 +298,9 @@ alter estimates. To correct the current target estimate:
    applicable. Use the recomputed SEs, CIs, and paired comparisons, not an old interval shifted
    by the correction. Retain the original audit as evidence about the unchanged map.
 5. Do not call reused correction labels independent validation of the corrected estimate.
+   If the same rows are also passed as transport probes, the audit is kept, a warning is
+   logged and the record says `probes_independent: false`; a probe that is exactly a row used
+   to fit the calibrator raises, so keep the fit external (`combine_oracle_sources=False`).
    Correction targets the sampled population; a future cycle or new fit needs its own evidence.
 6. The correction weights the calibrated prediction at one by default (the 0.8.x estimator).
    `estimator_config={"correction_weight": "tuned"}` (or `correction_weight="tuned"` in
@@ -375,8 +378,11 @@ directories.
 | Signal | Values | What to tell the user |
 |---|---|---|
 | `overall_status` | GOOD / WARNING / CRITICAL | CRITICAL: results shipped with explicit caveats only |
-| Boundary card | OK / CAUTION / REFUSE-LEVEL | Scalar score-range support only. REFUSE-LEVEL: no absolute level claim from this fit; it does not establish ranking validity |
+| Boundary card | OK / CAUTION / REFUSE-LEVEL | Scalar score-range support only. REFUSE-LEVEL: no absolute level claim from this fit; it does not establish ranking validity. A card with `applies_to_current_estimate: false` describes the map, not the reported (complete-oracle or residual-corrected) level |
 | `reliability_gates[p]["flagged"]` | bool | Surface the point estimate with the limitation; do not substitute another policy silently |
+| `reliability_gates[p]["notes"]` / `["exemption"]` | list / `"residual_corrected"` | A map finding that did not gate the corrected level, or a failed design check. Report it as evidence about the map, not about the corrected estimate |
+| `correction_checks[p]` | `passed`, `failed`, `effective_labelled_prompts`, `design_effective_n`, `balance_t` | Whether the correction's labels can lift map gates. A failure keeps the gates; `labelled_rows_unbalanced` means the labels do not look like the declared design's sample |
+| `level_basis[p]` | oracle / residual_corrected / calibration_map | What the reported level rests on. A corrected-vs-map ranking after a lifted FAIL is not established |
 | Transport `status` | PASS / FAIL / INCONCLUSIVE / NOT_GRADED / NOT_CHECKED | Equivalence verdict for the declared residual margin; interpret only for the audited population and family. NOT_CHECKED = no probe was supplied for that policy; never treat it as a pass |
 
 ## Troubleshooting

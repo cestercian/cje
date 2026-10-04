@@ -73,7 +73,7 @@ p-values).
 
 ## 2) Run a Transport Audit (Probe Protocol)
 
-Use oracle-labeled probes that were not used to fit the calibrator. Sample them according to a documented probability design on each deployment-relevant policy/group. At least 20 effective independent clusters are required for `PASS`; a decisive interval can still grade `FAIL` below that floor; the needed sample size is otherwise determined by the desired CI width and practical margin. Pass `TransportAuditConfig` to `analyze_dataset` to store every policy's state and merge an observed `FAIL` into the result gate:
+Use oracle-labeled probes that were not used to fit the calibrator. Sample them according to a documented probability design on each deployment-relevant policy/group. At least 20 effective independent clusters are required for `PASS`; a decisive interval can still grade `FAIL` below that floor; the needed sample size is otherwise determined by the desired CI width and practical margin. Pass `TransportAuditConfig` to `analyze_dataset` to store every policy's state and merge an observed `FAIL` into the result gate when that policy's level depends on the map. A complete-oracle policy, or a residual-corrected policy whose correction design check passes (`metadata["correction_checks"]`; thresholds `CORRECTION_EXEMPT_MIN_LABELLED_PROMPTS` and `CORRECTION_DESIGN_BALANCE_T` in `cje.diagnostics.gates`), keeps the `FAIL` as a note with `gate_exemption: "residual_corrected"` instead:
 
 ```python
 import json
@@ -187,7 +187,7 @@ Attach sampled target-policy `oracle_label` values to their matching evaluation 
 
 To preserve an external calibration fit, keep `calibration_data_path` and set `combine_oracle_sources=False`. This prevents those evaluation labels from refitting calibration while still allowing residual augmentation. Check `metadata["point_estimator"]["routes"]` for `augmented` and use the recomputed intervals. The [runnable guide](guides/audit-correction.md) demonstrates the complete workflow and label budget.
 
-Retain the original audit as evidence about the old map. The same labels are no longer an independent validation sample for the corrected estimate, and correction does not establish transport to another policy or a future cycle.
+Retain the original audit as evidence about the old map. The same labels are no longer an independent validation sample for the corrected estimate, and correction does not establish transport to another policy or a future cycle. If you pass them as probes in the same call, the audit is marked `probes_independent: false` with a warning; probes that are exactly calibration-fit rows raise.
 
 ### Step C: Escalate to refit if residuals show structural drift
 

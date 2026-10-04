@@ -310,11 +310,24 @@ def best_policy_lines(results: "EstimationResult") -> list:
         )
     if metadata and metadata.get("calibration_status") == "UNCALIBRATED":
         limitations.append("UNCALIBRATED raw judge-score mean")
+    from ..diagnostics.gates import correction_check_limitation, transport_limitation
+
     transport_audits = metadata.get("transport_audits", {}) if metadata else {}
     winner_audit = transport_audits.get(display, {})
-    transport_status = winner_audit.get("status", "NOT_CHECKED")
-    if transport_status != "PASS":
-        limitations.append(f"residual transport {transport_status}")
+    if not winner_audit:
+        limitations.append("residual transport NOT_CHECKED")
+    else:
+        transport_text = transport_limitation(winner_audit)
+        if transport_text:
+            limitations.append(transport_text)
+    ranking_limitation = getattr(results, "_ranking_basis_limitation", None)
+    ranking_text = ranking_limitation(display) if callable(ranking_limitation) else None
+    if ranking_text:
+        limitations.append(ranking_text)
+    checks = (metadata.get("correction_checks") or {}) if metadata else {}
+    check_text = correction_check_limitation(checks.get(display))
+    if check_text:
+        limitations.append(check_text)
 
     lines = [f"Best by point estimate: {display}"]
     if limitations:
@@ -375,6 +388,7 @@ def _dir_has_logprob_fields(directory: Path) -> bool:
 
 def run_analysis(args: argparse.Namespace) -> int:
     """Run the analysis command."""
+    from ..diagnostics.gates import correction_check_limitation
     from .analysis import LOGGED_DATA_PATH_REMOVED_MESSAGE, analyze_dataset
 
     # Set logging level
@@ -540,9 +554,26 @@ def run_analysis(args: argparse.Namespace) -> int:
                     f"(SE {se:.3f}, 95% CI [{ci_lower[i]:.3f}, {ci_upper[i]:.3f}])"
                 )
                 audit = results.metadata.get("transport_audits", {}).get(policy, {})
-                print(
+                transport_line = (
                     "    residual transport: " f"{audit.get('status', 'NOT_CHECKED')}"
                 )
+                if audit.get("gate_exemption") == "residual_corrected":
+                    transport_line += (
+                        " (calibration map only; estimate residual-corrected)"
+                    )
+                if audit.get("probes_independent") is False:
+                    n_reused = int(
+                        (audit.get("probe_overlap") or {}).get("n_reused", 0)
+                    )
+                    transport_line += (
+                        f"; probes reuse {n_reused} labelled evaluation rows "
+                        "(not independent)"
+                    )
+                print(transport_line)
+                check = (results.metadata.get("correction_checks") or {}).get(policy)
+                if check is not None and correction_check_limitation(check):
+                    codes = ", ".join(check.get("failed") or [])
+                    print(f"    residual correction design check: FAILED ({codes})")
 
             # Best policy (reliability-aware: an argmax that failed the
             # refusal-gate limitations are printed beside the point winner)

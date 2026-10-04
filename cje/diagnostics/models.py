@@ -96,13 +96,19 @@ class DirectDiagnostics:
 
     @property
     def refuse_level_policies(self) -> List[str]:
-        """Policies whose coverage badge refuses level claims."""
+        """Policies whose coverage badge refuses level claims.
+
+        Only badges that apply to the reported estimate count: a card with
+        ``applies_to_current_estimate`` False (complete-oracle or exempt
+        residual-corrected levels) describes the calibration map only.
+        """
         if not self.boundary_cards:
             return []
         return sorted(
             policy
             for policy, card in self.boundary_cards.items()
             if card.get("status") == "REFUSE-LEVEL"
+            and card.get("applies_to_current_estimate", True) is not False
         )
 
     @property
@@ -133,7 +139,10 @@ class DirectDiagnostics:
         # Check coverage badges (level-claim identification risk)
         if self.boundary_cards:
             for policy, card in self.boundary_cards.items():
-                if card.get("status") == "REFUSE-LEVEL":
+                if (
+                    card.get("status") == "REFUSE-LEVEL"
+                    and card.get("applies_to_current_estimate", True) is not False
+                ):
                     issues.append(
                         f"REFUSE-LEVEL for {policy}: "
                         f"{card.get('out_of_range', 0.0):.1%} of judge scores "

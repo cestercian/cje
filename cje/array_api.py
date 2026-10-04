@@ -21,6 +21,12 @@ import numpy as np
 from scipy import stats
 
 from .calibration.judge import JudgeCalibrator
+from .diagnostics.gates import (
+    corrected_gate_note,
+    correction_caution,
+    correction_design_check,
+    level_gate_scope,
+)
 from .diagnostics.reward_boundary import boundary_card_dict
 from .diagnostics.robust_inference import (
     DirectEvalTable,
@@ -72,7 +78,11 @@ class CalibratedMeanResult:
             complete oracle coverage makes calibration unnecessary; check it
             before requesting calibrator-dependent capabilities.
         diagnostics: Dict with calibration quality, the coverage badge
-            (`boundary_card`), and inference details.
+            (`boundary_card`), and inference details. Under partial coverage
+            it also holds `correction_check` (the residual correction's design
+            check); the badge has `applies_to_current_estimate` False when
+            that check passes, because the corrected level does not depend on
+            the calibration map.
     """
 
     estimate: float
@@ -560,8 +570,33 @@ def calibrated_mean_ci(
             "calibrator_available": True,
         },
     }
-    boundary = boundary_card_dict(calibrator, judge, rewards)
+    # Partial coverage always takes the representative augmented route, so the
+    # badge gates the level only when the correction design check fails
+    # (level_gate_scope). The estimate and interval do not depend on this.
+    check = correction_design_check(
+        judge,
+        mask,
+        cluster_strings,
+        "representative",
+        labelled_outcomes_constant=len(np.unique(np.round(labels[mask], 6))) == 1,
+    )
+    applies, scope = level_gate_scope("augmented", check)
+    diagnostics["correction_check"] = check
+    caution = correction_caution("policy", check)
+    if caution:
+        logger.warning(caution)
+    boundary = boundary_card_dict(calibrator, judge, rewards, emit_warning=applies)
     if boundary is not None:
+        boundary["applies_to_current_estimate"] = applies
+        boundary["gate_exemption"] = None if applies else scope
+        if not applies and boundary.get("status") == "REFUSE-LEVEL":
+            logger.info(
+                corrected_gate_note(
+                    f"boundary REFUSE-LEVEL ({boundary.get('out_of_range', 0.0):.1%} "
+                    "of judge scores outside the oracle calibration range)",
+                    check,
+                )
+            )
         diagnostics["boundary_card"] = boundary
 
     labels_nan = np.where(mask, labels, np.nan)

@@ -215,9 +215,15 @@ def _policy_probe(policy: str, n: int, shift: float = 0.0) -> List[Dict[str, Any
     ]
 
 
-def test_high_level_transport_records_all_graded_states() -> None:
+def test_high_level_transport_records_all_graded_states(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     policies = ["pass", "fail", "low_power", "descriptive", "missing"]
     draws = {policy: _labeled_policy(policy) for policy in policies}
+    # Every policy keeps labels only on its 20 lowest-scored rows, so its
+    # residual correction fails the design balance check (labels are not a
+    # representative sample of its rows) and the map gates still apply: the
+    # FAIL flags 'fail' exactly as in 0.9.0.
     for rows in draws.values():
         for row in rows[20:]:
             row.pop("oracle_label")
@@ -235,11 +241,12 @@ def test_high_level_transport_records_all_graded_states() -> None:
         },
     )
 
-    result = analyze_dataset(
-        fresh_draws_data=draws,
-        estimator_config={"inference_method": "cluster_robust"},
-        transport=config,
-    )
+    with caplog.at_level(logging.WARNING):
+        result = analyze_dataset(
+            fresh_draws_data=draws,
+            estimator_config={"inference_method": "cluster_robust"},
+            transport=config,
+        )
 
     audits = result.metadata["transport_audits"]
     assert audits["pass"]["status"] == "PASS"
@@ -251,8 +258,24 @@ def test_high_level_transport_records_all_graded_states() -> None:
     assert audits["descriptive"]["graded"] is False
     assert audits["missing"]["performed"] is False
     assert audits["fail"]["applies_to_current_estimate"] is True
+    assert audits["fail"]["route"] == "augmented"
+    assert audits["fail"]["gate_exemption"] is None
     assert result.metadata["transport_status"] == "FAIL"
     assert result.gates["fail"].flagged is True
+    check = result.metadata["correction_checks"]["fail"]
+    assert check["failed"] == ["labelled_rows_unbalanced"]
+    assert check["balance_t"]["judge_level"] == pytest.approx(-4.05, abs=0.01)
+    assert any(
+        "residual correction does not lift calibration-map gates" in reason
+        for reason in result.gates["fail"].reasons
+    )
+    design_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.getMessage().startswith("Residual correction for policy")
+    ]
+    assert len(design_warnings) == len(policies)
     assert np.all(np.isfinite(result.estimates))
     assert result.diagnostics is not None
     assert result.diagnostics.transport_status_per_policy == {

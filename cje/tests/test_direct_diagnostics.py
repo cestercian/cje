@@ -349,11 +349,18 @@ class TestCautionBandYieldsWarning:
         assert "Status: warning" in diag.summary()
         assert "warning" in result._repr_html_()
 
-        # The CLI still crowns the policy (WARNING is not a demotion)
+        # The CLI still crowns the policy (WARNING is not a demotion). The
+        # labelled rows are spread evenly over [0, 0.8] while the unlabelled
+        # mass sits at 0.4 and 0.79, so they are not a representative sample
+        # of the evaluation rows: the correction design check (added after
+        # 0.9.0) fails on judge-score balance (level t ~ -4.1). That keeps the
+        # card in scope (CAUTION -> WARNING as before) and adds a limitation,
+        # but never demotes.
         lines = best_policy_lines(result)
         assert lines == [
             "Best by point estimate: caution",
-            "Limitations: residual transport NOT_CHECKED",
+            "Limitations: residual transport NOT_CHECKED; residual correction "
+            "design check failed (labelled_rows_unbalanced)",
         ]
 
 
